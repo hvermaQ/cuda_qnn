@@ -28,8 +28,8 @@ x_train, x_test, y_train, y_test = train_test_split(
 )
 
 # Convert labels from {0,1} to {-1,+1}
-y_train = 2 * y_train - 1
-y_test = 2 * y_test - 1
+#y_train = 2 * y_train - 1
+#y_test = 2 * y_test - 1
 
 # Plot the data for clarity
 plt.figure(figsize=(8, 6))
@@ -51,8 +51,8 @@ y_test = torch.tensor(y_test, dtype=torch.float32).unsqueeze(1).to(device)
 # VQNN setup
 # VQC has 2 parms per qubit per layer (rx, ry, rz) + entangling cx gates
 n_qubits = 2
-depth = 10
-n_params = 3 * n_qubits * depth
+depth = 5
+n_params = 4 * n_qubits * depth
 hamiltonian = cudaq.spin.z(0)  # measure the z of qubit 0 for label prediction
 
 # Variational quantum kernel
@@ -61,17 +61,26 @@ hamiltonian = cudaq.spin.z(0)  # measure the z of qubit 0 for label prediction
 @cudaq.kernel
 def vqc_kernel(x0: float, x1: float, thetas: list[float]):
     q = cudaq.qvector(n_qubits)
-    # Encode features
+    #Encode data
     ry(x0, q[0])
     ry(x1, q[1])
     # Variational layers
     idx = 0
     for _ in range(depth):
+        # Encode features with reuploading
+        #ry(x0, q[0])
+        #ry(x1, q[1])
         for qubit in range(n_qubits):
-            rx(thetas[idx], q[qubit]); idx += 1
-            ry(thetas[idx], q[qubit]); idx += 1
-            rz(thetas[idx], q[qubit]); idx += 1
+            rx(thetas[idx], q[qubit])
+            idx += 1
+            ry(thetas[idx], q[qubit])
+            idx += 1
+            rz(thetas[idx], q[qubit])
+            idx += 1
+            rx(thetas[idx], q[qubit])
+            idx += 1
         cx(q[0], q[1])
+        cx(q[1], q[0])
 
 # =======================
 # ensure differentiability by defining a custom autograd function
@@ -128,7 +137,7 @@ class QuantumFunction(torch.autograd.Function):
 class QuantumLayer(nn.Module):
     def __init__(self, n_params):
         super().__init__()
-        self.thetas = nn.Parameter(torch.randn(n_params) * 0.1)
+        self.thetas = nn.Parameter(torch.randn(n_params))
 
     def forward(self, x_batch):
         return QuantumFunction.apply(self.thetas, x_batch)
@@ -150,13 +159,28 @@ class VQCClassifier(nn.Module):
 q_layer = QuantumLayer(n_params)
 model = VQCClassifier(q_layer).to(device)
 
+#accuracy function
+def compute_accuracy(model_of_device, x_true, y_true):
+    with torch.no_grad():
+        # Forward pass to get probabilities
+        probs = model_of_device(x_true)
+        # Convert probabilities to discrete labels using 0.5 threshold
+        predicted_labels = (probs >= 0.5).int()
+        # Compare with true labels and compute accuracy
+        correct = (predicted_labels == y_true.int()).sum().item()
+        accuracy = correct / len(y_true)
+    return accuracy
+
 # =======================
 # running and training on the training set
-criterion = nn.MSELoss()  # MSE loss is sufficient
-optimizer = optim.Adam(model.parameters(), lr=0.01)  # slightly lower lr for stability
+#criterion = nn.MSELoss()  # MSE loss is sufficient
+criterion = nn.BCELoss() # for probabilistic outputs
+#optimizer = optim.SGD(params=model.parameters(), lr=0.01)
+optimizer = optim.Adam(model.parameters(), lr=0.05)  # slightly lower lr for stability
+
 epochs = 100
 loss_trace = []
-
+accu_trace = []
 for epoch in range(epochs):
     optimizer.zero_grad()  # initialize gradients to zero
     outputs = model(x_train)  # use raw expectation values for training
@@ -164,8 +188,11 @@ for epoch in range(epochs):
     loss.backward()  # backprop to compute gradients
     optimizer.step()  # update params
 
+    acc = compute_accuracy(model, x_test, y_test)
     loss_trace.append(loss.item())
+    accu_trace.append(acc)
     print(f"Epoch {epoch}, Loss = {loss.item():.4f}")
+    print(f"Epoch {epoch}, Accuracy = {acc:.4f}")
 
 # =======================
 # plot training loss
@@ -173,10 +200,19 @@ plt.plot(loss_trace)
 plt.title("Training Loss")
 plt.show()
 
+# plot accuracy trace
+plt.plot(accu_trace)
+plt.title("Accuracy during training")
+plt.show()
+
 # =======================
 # evaluate accuracy of the model on test set
 with torch.no_grad():
-    preds = model(x_test)
-    predicted_labels = torch.sign(preds)  # convert raw ⟨Z⟩ to ±1 for evaluation
-    acc = (predicted_labels.eq(y_test).sum().item()) / len(y_test)
-print("Test Accuracy =", acc)
+    # Forward pass to get probabilities
+    probs = model(x_test)
+    # Convert probabilities to discrete labels using 0.5 threshold
+    predicted_labels = (probs >= 0.5).int()
+    # Compare with true labels and compute accuracy
+    correct = (predicted_labels == y_test.int()).sum().item()
+    accuracy = correct / len(y_test)
+print("Test Accuracy =", accuracy)

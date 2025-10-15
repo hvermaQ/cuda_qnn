@@ -14,7 +14,7 @@ cudaq.set_target("nvidia")
 
 # generate data for binary classification problem
 x_full, y_full = make_classification(
-    n_samples=100, n_features=2, n_informative=2,
+    n_samples=1000, n_features=2, n_informative=2,
     n_redundant=0, n_clusters_per_class=1, random_state=42
 )
 x_full = (x_full - np.mean(x_full, axis=0)) / np.std(x_full, axis=0)
@@ -44,7 +44,7 @@ plt.show()
 
 # VQNN setup
 # VQC has 2 params per qubit per layer (rx, ry, rz) + entangling cx gates
-depths = [1, 2, 3, 4, 5]  # circuit layers to try
+depths = [2, 3, 4, 5, 6]  # circuit layers to try
 n_qubits = 2 #qubits, two for the two features here, replace by autoencoder
 accuracy_results = []
 
@@ -61,10 +61,16 @@ def vqc_kernel(x0: float, x1: float, thetas: list[float], depth: int):
     # Variational layers using depth argument
     for _ in range(depth):
         for qubit in range(n_qubits):
-            rx(thetas[idx], q[qubit]); idx += 1
-            ry(thetas[idx], q[qubit]); idx += 1
-            rz(thetas[idx], q[qubit]); idx += 1
+            rx(thetas[idx], q[qubit])
+            idx += 1
+            ry(thetas[idx], q[qubit])
+            idx += 1
+            rz(thetas[idx], q[qubit])
+            idx += 1
+            rx(thetas[idx], q[qubit])
+            idx += 1
         cx(q[0], q[1])
+        cx(q[1], q[0])
 
 #hamiltonian is sum of the expectation values of z on both qubits
 #hamiltonian = cudaq.spin.z(0) + cudaq.spin.z(1)  
@@ -109,10 +115,10 @@ class QuantumFunction(torch.autograd.Function):
             exp_plus = torch.zeros((x_batch.shape[0],), device=x_batch.device)
             exp_minus = torch.zeros((x_batch.shape[0],), device=x_batch.device)
             for idx, x in enumerate(x_batch):
-                r_plus = cudaq.observe(vqc_kernel, cudaq.spin.z(0),
+                r_plus = cudaq.observe(vqc_kernel, hamiltonian,
                                         float(x[0].item()), float(x[1].item()),
                                         thetas_plus.tolist(), depth)
-                r_minus = cudaq.observe(vqc_kernel, cudaq.spin.z(0),
+                r_minus = cudaq.observe(vqc_kernel, hamiltonian,
                                         float(x[0].item()), float(x[1].item()),
                                         thetas_minus.tolist(), depth)
                 exp_plus[idx] = r_plus.expectation() #expectation value for positive shift
@@ -127,7 +133,7 @@ class QuantumFunction(torch.autograd.Function):
 class QuantumLayer(nn.Module):
     def __init__(self, n_params, depth):
         super().__init__()
-        self.thetas = nn.Parameter(torch.randn(n_params) * 0.1)
+        self.thetas = nn.Parameter(torch.randn(n_params))
         self.depth = depth
 
     def forward(self, x_batch):
@@ -138,24 +144,37 @@ class VQCClassifier(nn.Module):
     def __init__(self, q_layer):
         super().__init__()
         self.q_layer = q_layer
-        # self.fc = nn.Sigmoid()  # postprocessing layer/ not NN layer: map ⟨Z⟩ → probability
+        self.fc = nn.Sigmoid()  # postprocessing layer/ not NN layer: map ⟨Z⟩ → probability
 
     def forward(self, x):
-        # return self.fc(self.q_layer(x)) #apply sigmoid after processing by quantum layer
-        return self.q_layer(x)  # no postprocessing, only expectation value used directly
+        return self.fc(self.q_layer(x)) #apply sigmoid after processing by quantum layer
+        #return self.q_layer(x)  # no postprocessing, only expectation value used directly
 
 # Loop over circuit depths
 epochs = 100 
 
+#accuracy function
+def compute_accuracy(model_of_device, x_true, y_true):
+    with torch.no_grad():
+        # Forward pass to get probabilities
+        probs = model_of_device(x_true)
+        # Convert probabilities to discrete labels using 0.5 threshold
+        predicted_labels = (probs >= 0.5).int()
+        # Compare with true labels and compute accuracy
+        correct = (predicted_labels == y_true.int()).sum().item()
+        accuracy = correct / len(y_true)
+    return accuracy
+
 for depth in depths:
-    n_params = 3 * n_qubits * depth
+    n_params = 4 * n_qubits * depth
     #instantiate the layers and task
     q_layer = QuantumLayer(n_params, depth)
     model = VQCClassifier(q_layer).to(device)
     #optimizer instantiation with hyperparameters
-    optimizer = optim.SGD(params=model.parameters(), lr=0.01)  # params will be set in loop
-    #optimizer = optim.Adam(model.parameters(), lr=0.01)
-    criterion = nn.MSELoss()
+    #optimizer = optim.SGD(params=model.parameters(), lr=0.01)  # params will be set in loop
+    optimizer = optim.Adam(model.parameters(), lr=0.01)
+    #criterion = nn.MSELoss()
+    criterion = nn.BCELoss() # for probabilistic outputs
 
     for epoch in range(epochs):
         #init gradients to zero
@@ -169,11 +188,15 @@ for depth in depths:
 
     # Evaluate accuracy
     with torch.no_grad():
-        preds = model(x_test)
-        predicted_labels = torch.sign(preds)
-        acc = (predicted_labels.eq(y_test).sum().item()) / len(y_test)
-    accuracy_results.append(acc)
-    print(f"Depth {depth}: Test Accuracy = {acc:.4f}")
+        # Forward pass to get probabilities
+        probs = model(x_test)
+        # Convert probabilities to discrete labels using 0.5 threshold
+        predicted_labels = (probs >= 0.5).int()
+        # Compare with true labels and compute accuracy
+        correct = (predicted_labels == y_test.int()).sum().item()
+        accuracy = correct / len(y_test)
+    accuracy_results.append(accuracy)
+    print(f"Depth {depth}: Test Accuracy = {accuracy:.4f}")
 
 # =======================
 # Plot depth vs accuracy
@@ -183,4 +206,5 @@ plt.xlabel("Circuit Depth")
 plt.ylabel("Test Accuracy")
 plt.title("Effect of Circuit Depth on VQC Accuracy")
 plt.grid(True)
+plt.savefig("figs/trial_circuit.png")
 plt.show()
