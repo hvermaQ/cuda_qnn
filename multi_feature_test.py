@@ -19,8 +19,8 @@ n_qubits = 4 #also the number of features
 
 #hamiltonian or observle is a sum of z, can be tweaked
 hamiltonian = cudaq.spin.z(0)  # measure the z of qubit 0 for label prediction
-for i in range(1, n_qubits):
-    hamiltonian = cudaq.spin.z(i)  # measure the z of qubit i for label prediction
+#for i in range(1, n_qubits):
+#    hamiltonian = cudaq.spin.z(i)  # measure the z of qubit i for label prediction
 
 # running routine on GPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -28,7 +28,7 @@ cudaq.set_target("nvidia")  # run all quantum circuits on NVIDIA GPU
 
 # generate data for classification
 x_full, y_full = make_classification(
-    n_samples=100, n_features=5, n_informative=5,
+    n_samples=100, n_features=n_qubits, n_informative=n_qubits,
     n_redundant=0, n_clusters_per_class=1, random_state=42
 )
 
@@ -47,7 +47,7 @@ x_train, x_test, y_train, y_test = train_test_split(
 # Plot the data for clarity
 plt.figure(figsize=(8, 6))
 plt.scatter(x_full[:, 0], x_full[:, 1], c=y_full, cmap='bwr', edgecolors='k')
-plt.title("Synthetic Classification Dataset (5 features), one label")
+plt.title("Synthetic Classification Dataset (%s features), one label")
 plt.xlabel("Feature 1")
 plt.ylabel("Feature 2")
 plt.grid(True)
@@ -68,16 +68,21 @@ def bounded_thetas(raw_params, theta0=0.1, eps_max=0.2):
 #main kernel to tune chaos
 @cudaq.kernel
 def XXZ_model(lambda_param: float,
-                           n_qubits: int,
-                           N_trot: int,
-                           thetas: list[float],
-                           h: list[float]):
+              n_qubits: int,
+              N_trot: int,
+              thetas: list[float],
+              h: list[float],
+              features: list[float]):
     """
     thetas: one variational angle per Trotter step, shared across XX, YY, ZZ
     h: local fields (can be random)
     lambda_param: chaos control
     """
     q = cudaq.qvector(n_qubits)
+
+    #feature encoding
+    for i in range(n_qubits):
+        ry(features[i], q[i])
 
     for k in range(N_trot):
         theta = thetas[k]  # shared angle for this Trotter step
@@ -89,13 +94,13 @@ def XXZ_model(lambda_param: float,
             cx(q[i], q[i+1])
 
             # YY coupling
-            ry(np.pi / 2, q[i])
-            ry(np.pi / 2, q[i+1])
+            ry(math.pi/2, q[i])
+            ry(math.pi/2, q[i+1])
             cx(q[i], q[i+1])
             rx(2 * theta, q[i+1])
             cx(q[i], q[i+1])
-            ry(-np.pi / 2, q[i])
-            ry(-np.pi / 2, q[i+1])
+            ry(-math.pi/2, q[i])
+            ry(-math.pi/2, q[i+1])
 
             # ZZ coupling
             cx(q[i], q[i+1])
@@ -114,16 +119,17 @@ def XXZ_model(lambda_param: float,
 # instantiate torch_autograd for forward and backward passes
 class QuantumFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, thetas, x_batch):
+    def forward(ctx, thetas, x_batch, lambda_param, h):
         ctx.save_for_backward(thetas, x_batch)
+        ctx.lambda_param = lambda_param
+        ctx.h = h
         ctx.shift = np.pi / 2
 
-        # Sequential evaluation of the batch (safe for GPU)
         outs = []
         for x in x_batch:
-            result = cudaq.observe(vqc_kernel, hamiltonian,
-                                   float(x[0].item()), float(x[1].item()),
-                                   thetas.tolist())
+            result = cudaq.observe(XXZ_model, hamiltonian,
+                                   float(lambda_param), int(n_qubits),
+                                   int(N_trot), thetas.tolist(), h, x.tolist())
             outs.append(result.expectation())
         return torch.tensor(outs, dtype=torch.float32, device=x_batch.device).unsqueeze(1)
 
@@ -131,9 +137,10 @@ class QuantumFunction(torch.autograd.Function):
     def backward(ctx, grad_output):
         thetas, x_batch = ctx.saved_tensors
         shift = ctx.shift
+        lambda_param = ctx.lambda_param
+        h = ctx.h
         grad = torch.zeros_like(thetas, device=thetas.device)
 
-        # Sequential parameter-shift rule
         for i in range(len(thetas)):
             thetas_plus = thetas.clone()
             thetas_minus = thetas.clone()
@@ -142,20 +149,19 @@ class QuantumFunction(torch.autograd.Function):
 
             exp_plus, exp_minus = [], []
             for x in x_batch:
-                r_plus = cudaq.observe(vqc_kernel, hamiltonian,
-                                        float(x[0].item()), float(x[1].item()),
-                                        thetas_plus.tolist())
-                r_minus = cudaq.observe(vqc_kernel, hamiltonian,
-                                         float(x[0].item()), float(x[1].item()),
-                                         thetas_minus.tolist())
+                r_plus = cudaq.observe(XXZ_model, hamiltonian,
+                                       float(lambda_param), int(n_qubits),
+                                       int(N_trot), thetas_plus.tolist(), h, x.tolist())
+                r_minus = cudaq.observe(XXZ_model, hamiltonian,
+                                        float(lambda_param), int(n_qubits),
+                                        int(N_trot), thetas_minus.tolist(), h, x.tolist())
                 exp_plus.append(r_plus.expectation())
                 exp_minus.append(r_minus.expectation())
 
-            # Compute mean over batch and multiply by grad_output (chain rule)
             grad[i] = ((torch.tensor(exp_plus, device=thetas.device) -
                         torch.tensor(exp_minus, device=thetas.device)).mean() / 2) * grad_output.mean()
 
-        return grad, None
+        return grad, None, None, None
 
 # promote the quantum layer to a NN module
 # define forward pass using the autograd function
@@ -164,8 +170,8 @@ class QuantumLayer(nn.Module):
         super().__init__()
         self.thetas = nn.Parameter(torch.randn(n_params))
 
-    def forward(self, x_batch):
-        return QuantumFunction.apply(self.thetas, x_batch)
+    def forward(self, x_batch, lambda_param, h):
+        return QuantumFunction.apply(self.thetas, x_batch, lambda_param, h)
 
 # use layers as in above to define outputs from a classifier
 class VQCClassifier(nn.Module):
@@ -174,28 +180,26 @@ class VQCClassifier(nn.Module):
         self.q_layer = q_layer
         self.fc = nn.Sigmoid()  # postprocessing layer/ not NN layer: map ⟨Z⟩ → probability
 
-    def forward(self, x):
-        return self.fc(self.q_layer(x)) #apply sigmoid after processing by quantum layer
+    def forward(self, x, lambda_param, h):
+        return self.fc(self.q_layer(x, lambda_param, h)) #apply sigmoid after processing by quantum layer
         #return self.q_layer(x)  # no postprocessing, only expectation value used directly
 
 #accuracy function
-def compute_accuracy(model_of_device, x_true, y_true):
+def compute_accuracy(model_of_device, x_true, y_true, lam, h):
     with torch.no_grad():
-        # Forward pass to get probabilities
-        probs = model_of_device(x_true)
-        # Convert probabilities to discrete labels using 0.5 threshold
+        probs = model_of_device(x_true, lam, h)
         predicted_labels = (probs >= 0.5).int()
-        # Compare with true labels and compute accuracy
         correct = (predicted_labels == y_true.int()).sum().item()
         accuracy = correct / len(y_true)
     return accuracy
 
 
 #problem setup
-N_trot = 5 #fixed depth
+N_trot = 8 #fixed depth
 theta0 = 0.1 
 eps_max = 0.2
 n_params = N_trot
+n_epochs = 100
 
 # ansatz generating Hamiltonian parameter setup
 rng = np.random.default_rng(42)
@@ -217,33 +221,28 @@ for lam in lambdas:
     # Effective regime: λ small = integrable, λ ~ 1 = chaotic, λ large = localized
     print(f"\n=== λ = {lam:.3f} ===")
 
-    # Instantiate quantum layer and classifier for each λ
+    # instantiating the NN layers
     q_layer = QuantumLayer(n_params)
     model = VQCClassifier(q_layer).to(device)
 
     optimizer = optim.Adam(model.parameters(), lr=0.01)
     criterion = nn.BCELoss()
 
-    for epoch in range(20):
+    for epoch in range(n_epochs):
         optimizer.zero_grad()
-        outputs = model(x_train)
-        loss = criterion(outputs, y_train)
+        outputs = model(torch.tensor(x_train[:, :n_qubits], dtype=torch.float32).to(device), lam, h)
+        loss = criterion(outputs, torch.tensor(y_train, dtype=torch.float32).unsqueeze(1).to(device))
         loss.backward()
         optimizer.step()
 
     # Evaluate accuracy
-    with torch.no_grad():
-    # Forward pass to get probabilities
-        probs = model(x_test)
-        # Convert probabilities to discrete labels using 0.5 threshold
-        predicted_labels = (probs >= 0.5).int()
-        # Compare with true labels and compute accuracy
-        correct = (predicted_labels == y_test.int()).sum().item()
-        accuracy = correct / len(y_test)
+    acc = compute_accuracy(model,
+                           torch.tensor(x_test[:, :n_qubits], dtype=torch.float32).to(device),
+                           torch.tensor(y_test, dtype=torch.float32).unsqueeze(1).to(device),
+                           lam, h)
 
-    #writing in the traces
     final_losses.append(loss.item())
-    final_accuracies.append(accuracy)
+    final_accuracies.append(acc)
 
     print(f"Final Loss: {loss.item():.4f}, Accuracy: {acc:.3f}")
 
@@ -253,5 +252,88 @@ plt.plot(lambdas, final_accuracies, 'o-', color='orange')
 plt.xlabel("λ (Local Field Strength)")
 plt.ylabel("Test Accuracy")
 plt.title("VQC Performance vs Chaos Strength λ")
+plt.grid(True)
+plt.show()
+
+
+# Helper function: compute chaos metric from the circuit
+def circuit_chaos_ratio(model, x_batch, lambda_param, h):
+    """
+    Compute a proxy for chaos directly from the quantum circuit.
+    Here we use the variance of Z-expectation values across the batch.
+    Higher variance indicates more chaotic / scrambled behavior.
+    """
+    with torch.no_grad():
+        outputs = model(x_batch, lambda_param, h)
+    # variance across batch
+    ratio = torch.var(outputs).item()
+    return ratio
+
+# Target chaos ratio we want to maintain
+target_ratio = 0.05  # choose based on observed variance
+lambda_penalty_weight = 10.0  # weight for penalty from deviated chaos
+
+# Sweep over field strength λ → chaos control
+final_losses, final_accuracies = [], []
+
+for lam in lambdas:
+    # Effective regime: λ small = integrable, λ ~ 1 = chaotic, λ large = localized
+    print(f"\n=== λ = {lam:.3f} ===")
+
+    # instantiating the NN layers
+    q_layer = QuantumLayer(n_params)
+    model = VQCClassifier(q_layer).to(device)
+
+    optimizer = optim.Adam(model.parameters(), lr=0.01)
+    criterion = nn.BCELoss()
+
+    for epoch in range(n_epochs):
+        optimizer.zero_grad()
+
+        # Prepare input batch
+        x_batch = torch.tensor(x_train[:, :n_qubits], dtype=torch.float32).to(device)
+        y_batch = torch.tensor(y_train, dtype=torch.float32).unsqueeze(1).to(device)
+
+        # Forward pass
+        outputs = model(x_batch, lam, h)
+
+        # Standard task loss
+        task_loss = criterion(outputs, y_batch)
+
+        # Compute chaos ratio directly from the quantum circuit
+        current_ratio = circuit_chaos_ratio(model, x_batch, lam, h)
+
+        # Penalty for deviating from target chaos ratio
+        chaos_penalty = (current_ratio - target_ratio)**2
+
+        # Total loss = task loss + weighted chaos penalty
+        loss_total = task_loss + lambda_penalty_weight * chaos_penalty
+
+        # Backward pass + optimization
+        loss_total.backward()
+        optimizer.step()
+
+        # Optional: monitor progress every 10 epochs
+        if epoch % 10 == 0:
+            print(f"Epoch {epoch}: Task Loss={task_loss.item():.4f}, "
+                  f"Chaos Ratio={current_ratio:.4f}, Total Loss={loss_total.item():.4f}")
+
+    # Evaluate accuracy
+    acc = compute_accuracy(model,
+                           torch.tensor(x_test[:, :n_qubits], dtype=torch.float32).to(device),
+                           torch.tensor(y_test, dtype=torch.float32).unsqueeze(1).to(device),
+                           lam, h)
+
+    final_losses.append(loss_total.item())
+    final_accuracies.append(acc)
+
+    print(f"Final Loss: {loss_total.item():.4f}, Accuracy: {acc:.3f}, Chaos Ratio: {current_ratio:.4f}")
+
+# Plot performance vs chaos strength λ
+plt.figure(figsize=(8, 6))
+plt.plot(lambdas, final_accuracies, 'o-', color='orange')
+plt.xlabel("λ (Local Field Strength)")
+plt.ylabel("Test Accuracy")
+plt.title("VQC Performance vs Chaos Strength λ (with Chaos Penalty)")
 plt.grid(True)
 plt.show()
